@@ -39,8 +39,8 @@ android {
             // can't break state restore. Resource shrinking is safe too — the
             // Solar icons live in assets/icons/ (not res/), which the resource
             // shrinker never touches.
-            isMinifyEnabled = true
-            isShrinkResources = true
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
