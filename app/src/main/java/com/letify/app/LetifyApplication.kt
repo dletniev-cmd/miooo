@@ -1,7 +1,11 @@
 package com.letify.app
 
 import android.app.Application
+import android.content.ContentUris
+import android.content.ContentValues
 import android.content.Context
+import android.os.Build
+import android.provider.MediaStore
 import android.util.Log
 import com.letify.app.ui.icons.SolarIconLoader
 import java.io.File
@@ -16,27 +20,26 @@ import java.util.Locale
  *
  * Beyond the usual lifecycle hook, this class installs a process-wide
  * `Thread.UncaughtExceptionHandler` that serialises every fatal stack
- * trace to a file in the app's cache directory. The next time the app
- * launches it can detect the file, show the user a one-tap "Copy logs"
- * dialog, and forward the captured stack trace to the clipboard so they
- * can paste it back to us. After capture we still call through to the
- * platform-default handler so the OS gets to do its own crash reporting
- * (and the process actually dies).
+ * trace to disk. Because a launch-time crash never gives the UI a chance
+ * to show a "copy logs" dialog, the report is written to places the user
+ * can actually reach from the phone with no computer and no permissions:
  *
- * onCreate also kicks off the background icon prewarm so the work
- * starts overlapping with MainActivity's window inflation instead of
- * waiting for setContent. MainActivity then briefly waits on a latch
- * for the 5 navbar icons to be decoded before calling setContent —
- * see SolarIconLoader for the full design.
+ *   1. Public "Downloads" as `логи.txt` (MediaStore, API 29+).
+ *   2. The app-specific external dir `Android/data/<pkg>/files/логи.txt`
+ *      (works on every API level, no permission needed).
+ *   3. The internal cache `last_crash.txt` (kept for the in-app dialog on
+ *      a non-fatal-launch crash).
+ *
+ * After capture we still call through to the platform-default handler so
+ * the OS gets to do its own crash reporting (and the process actually dies).
+ *
+ * onCreate also kicks off the background icon prewarm so the work starts
+ * overlapping with MainActivity's window inflation.
  */
 class LetifyApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         CrashReporter.install(this)
-        // Fire-and-forget — populates SolarIconLoader.bitmaps on a
-        // daemon worker. Idempotent; MainActivity calls it again
-        // defensively in case Application.onCreate was skipped (e.g.
-        // by some constrained runtime).
         SolarIconLoader.prewarmAll(this)
     }
 }
@@ -45,6 +48,7 @@ object CrashReporter {
 
     private const val TAG = "LetifyCrash"
     private const val CRASH_FILE = "last_crash.txt"
+    private const val USER_LOG_NAME = "логи.txt"
     private const val MAX_RETAINED_BYTES = 256 * 1024
 
     fun install(context: Context) {
@@ -57,38 +61,94 @@ object CrashReporter {
                 Log.e(TAG, "failed to write crash report", t)
             }
             // Defer to the platform handler so Android still surfaces the
-            // crash dialog / kills the process. Swallowing here would
-            // leave the process zombied with a torn-down UI.
+            // crash dialog / kills the process.
             previous?.uncaughtException(thread, throwable)
         }
     }
 
     private fun crashFile(context: Context): File = File(context.cacheDir, CRASH_FILE)
 
-    private fun writeReport(context: Context, thread: Thread, throwable: Throwable) {
+    private fun buildReport(context: Context, thread: Thread, throwable: Throwable): String {
         val sw = StringWriter()
         PrintWriter(sw).use { pw ->
-            pw.println("Letify crash log")
+            pw.println("Анкетница — лог вылета")
             pw.println(
                 "Time: " +
                     SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date()),
             )
             pw.println("Package: ${context.packageName}")
+            val version = runCatching {
+                val pi = context.packageManager.getPackageInfo(context.packageName, 0)
+                "${pi.versionName} (${pi.longVersionCodeCompat()})"
+            }.getOrNull()
+            if (version != null) pw.println("Version: $version")
             pw.println("Thread: ${thread.name}")
-            pw.println("Android: ${android.os.Build.VERSION.RELEASE} (sdk ${android.os.Build.VERSION.SDK_INT})")
-            pw.println("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+            pw.println("Android: ${Build.VERSION.RELEASE} (sdk ${Build.VERSION.SDK_INT})")
+            pw.println("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
             pw.println()
+            // The cause chain — printStackTrace already walks Caused-by links.
             throwable.printStackTrace(pw)
         }
         val text = sw.toString()
-            .let { if (it.length > MAX_RETAINED_BYTES) it.take(MAX_RETAINED_BYTES) else it }
-        crashFile(context).writeText(text)
+        return if (text.length > MAX_RETAINED_BYTES) text.take(MAX_RETAINED_BYTES) else text
+    }
+
+    private fun writeReport(context: Context, thread: Thread, throwable: Throwable) {
+        val text = buildReport(context, thread, throwable)
+        // 1) internal cache (for the in-app "copy logs" dialog).
+        runCatching { crashFile(context).writeText(text, Charsets.UTF_8) }
+        // 2) app-specific external dir — no permission, reachable via a file
+        //    manager at Android/data/<pkg>/files/логи.txt.
+        runCatching {
+            context.getExternalFilesDir(null)?.let { dir ->
+                File(dir, USER_LOG_NAME).writeText(text, Charsets.UTF_8)
+            }
+        }
+        // 3) public Downloads via MediaStore (API 29+) — easiest for the user
+        //    to find and share. Best-effort.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { writeToDownloads(context, text) }
+        }
+    }
+
+    private fun writeToDownloads(context: Context, text: String) {
+        val resolver = context.contentResolver
+        val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+
+        // Remove any prior лог so a single, current file is left behind.
+        runCatching {
+            resolver.query(
+                collection,
+                arrayOf(MediaStore.MediaColumns._ID),
+                "${MediaStore.MediaColumns.DISPLAY_NAME} = ?",
+                arrayOf(USER_LOG_NAME),
+                null,
+            )?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idCol)
+                    val uri = ContentUris.withAppendedId(collection, id)
+                    runCatching { resolver.delete(uri, null, null) }
+                }
+            }
+        }
+
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, USER_LOG_NAME)
+            put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(collection, values) ?: return
+        resolver.openOutputStream(uri)?.use { out ->
+            out.write(text.toByteArray(Charsets.UTF_8))
+        }
+        val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+        runCatching { resolver.update(uri, done, null, null) }
     }
 
     /**
-     * Returns the previously-captured crash report, or `null` if the
-     * previous session terminated cleanly. The file is left on disk —
-     * call [consume] after the user has had a chance to copy it.
+     * Returns the previously-captured crash report, or `null` if the previous
+     * session terminated cleanly.
      */
     fun read(context: Context): String? {
         val f = crashFile(context.applicationContext)
@@ -99,3 +159,8 @@ object CrashReporter {
         crashFile(context.applicationContext).delete()
     }
 }
+
+/** versionCode across API levels (longVersionCode added in API 28). */
+private fun android.content.pm.PackageInfo.longVersionCodeCompat(): Long =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) longVersionCode
+    else @Suppress("DEPRECATION") versionCode.toLong()
